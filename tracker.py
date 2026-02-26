@@ -4,7 +4,9 @@ March Madness Tracker
 Fetches NCAA Men's Basketball stats, predicts seedings,
 and generates bracket predictions. Exports everything to CSV.
 
-Data source: sports-reference.com / ESPN API (public endpoints)
+Data sources:
+  - henrygd/ncaa-api  → live scores, standings, rankings (no key needed)
+  - barttorvik.com    → NET rankings, T-Rank, advanced metrics (no key needed)
 """
 
 import csv
@@ -20,99 +22,109 @@ import requests
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ── ESPN public API ──────────────────────────────────────────────────────────
-ESPN_SCOREBOARD   = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
-ESPN_TEAMS        = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams"
-ESPN_RANKINGS     = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/rankings"
-ESPN_TEAM_STATS   = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/{team_id}/statistics"
+# ── API base URLs ─────────────────────────────────────────────────────────────
+NCAA_API_BASE  = "https://ncaa-api.henrygd.me"
+BBART_BASE     = "https://barttorvik.com"
 
 HEADERS = {"User-Agent": "MarchMadnessTracker/1.0 (educational project)"}
 
-# ── Conferences that historically send the most NCAA Tourney teams ───────────
+# Current season year (update each year)
+CURRENT_YEAR = datetime.now().year
+SEASON       = CURRENT_YEAR if datetime.now().month >= 10 else CURRENT_YEAR - 1
+
+# ── Conferences that historically send the most NCAA Tourney teams ─────────────
 POWER_CONFERENCES = {
     "SEC", "Big Ten", "Big 12", "ACC", "Big East",
     "Pac-12", "American", "Mountain West", "Atlantic 10", "WCC"
 }
 
-# ── Seeding helpers ──────────────────────────────────────────────────────────
+
+# ── Seeding helpers ───────────────────────────────────────────────────────────
 def compute_seed_score(team: dict) -> float:
     """
-    Simple composite score used for projected seeding.
-    Higher = better seed.
+    Composite score used for projected seeding. Higher = better seed.
     Components:
-      - Win % (heavily weighted)
-      - RPI rank (inverted so lower rank → higher score)
-      - NET rank (same)
-      - SOS (strength of schedule, 0–1 scale)
+      - Win %           (40 pts) — heavily weighted
+      - NET rank        (25 pts) — official NCAA metric
+      - T-Rank/Barthag  (20 pts) — Barttorvik strength metric
+      - SOS             (15 pts) — strength of schedule
     """
-    w  = team.get("wins", 0)
-    l  = team.get("losses", 0)
+    w     = team.get("wins",    0)
+    l     = team.get("losses",  0)
     total = w + l
     win_pct = w / total if total else 0
 
-    rpi  = team.get("rpi_rank", 200)
-    net  = team.get("net_rank", 200)
-    sos  = team.get("sos", 0.5)         # 0–1
+    net   = team.get("net_rank",  200)
+    trank = team.get("trank",     200)   # Barttorvik T-Rank
+    sos   = team.get("sos",       0.5)   # 0–1 scale
 
-    score = (win_pct * 40) + ((200 - rpi) / 200 * 30) + ((200 - net) / 200 * 20) + (sos * 10)
+    score = (
+        (win_pct * 40) +
+        ((200 - net)   / 200 * 25) +
+        ((200 - trank) / 200 * 20) +
+        (sos * 15)
+    )
     return round(score, 3)
 
 
 def assign_seeds(teams: list[dict]) -> list[dict]:
     """
     Sort teams by seed_score, assign projected seeds 1–16 per region.
-    Only top 68 teams make the field (first 4 out get 'bubble').
+    Top 68 teams make the field; next 4 are 'bubble'.
     """
     sorted_teams = sorted(teams, key=lambda t: t["seed_score"], reverse=True)
-
-    regions = ["East", "West", "South", "Midwest"]
-    region_counts = {r: 0 for r in regions}
+    regions      = ["East", "West", "South", "Midwest"]
 
     for i, team in enumerate(sorted_teams):
         rank = i + 1
         if rank <= 64:
-            region_idx = (rank - 1) % 4
-            region = regions[region_idx]
-            seed   = ((rank - 1) // 4) + 1
+            region_idx              = (rank - 1) % 4
+            region                  = regions[region_idx]
+            seed                    = ((rank - 1) // 4) + 1
             team["projected_seed"]   = seed
             team["projected_region"] = region
-            region_counts[region] += 1
         elif rank <= 68:
             team["projected_seed"]   = "First Four"
             team["projected_region"] = "Play-in"
+        elif rank <= 72:
+            team["projected_seed"]   = "Bubble"
+            team["projected_region"] = "—"
         else:
-            team["projected_seed"]   = "Bubble" if rank <= 72 else "Not in field"
+            team["projected_seed"]   = "Not in field"
             team["projected_region"] = "—"
 
     return sorted_teams
 
 
-# ── Bracket simulation ───────────────────────────────────────────────────────
+# ── Bracket simulation ────────────────────────────────────────────────────────
 def simulate_game(team_a: dict, team_b: dict) -> dict:
     """
-    Monte-Carlo-style game sim: higher seed_score wins with probability
-    proportional to score difference. Returns winning team dict.
+    Monte-Carlo game sim weighted by seed_score AND barthag (if available).
+    Returns the winning team dict.
     """
-    sa = team_a["seed_score"]
-    sb = team_b["seed_score"]
-    total = sa + sb
-    prob_a = sa / total if total else 0.5
+    # Use barthag (win prob vs average D1) if available, else seed_score
+    sa = team_a.get("barthag", team_a["seed_score"] / 100)
+    sb = team_b.get("barthag", team_b["seed_score"] / 100)
+    total    = sa + sb
+    prob_a   = sa / total if total else 0.5
     return team_a if random.random() < prob_a else team_b
 
 
 def simulate_bracket(field: list[dict], simulations: int = 1000) -> list[dict]:
     """
-    Run `simulations` bracket sims. Return teams enriched with:
-      - win_prob_r64, _r32, _s16, _e8, _f4, _championship, _champion
+    Run `simulations` bracket sims. Enriches each team with:
+      prob_r64, prob_r32, prob_s16, prob_e8, prob_f4,
+      prob_championship, prob_champion
     """
-    rounds = ["r64", "r32", "s16", "e8", "f4", "championship", "champion"]
+    rounds     = ["r64", "r32", "s16", "e8", "f4", "championship", "champion"]
     win_counts = {t["id"]: {r: 0 for r in rounds} for t in field}
 
-    # Only simulate the 64-team field
-    tourney = [t for t in field if isinstance(t.get("projected_seed"), int) and t["projected_seed"] <= 16]
+    tourney = [
+        t for t in field
+        if isinstance(t.get("projected_seed"), int) and t["projected_seed"] <= 16
+    ]
 
     for _ in range(simulations):
-        # Group by region
         region_teams: dict[str, list] = {}
         for t in tourney:
             r = t["projected_region"]
@@ -122,9 +134,8 @@ def simulate_bracket(field: list[dict], simulations: int = 1000) -> list[dict]:
         final_four: list[dict] = []
 
         for region, rteams in region_teams.items():
-            # Sort by seed for proper 1v16, 2v15 … matchups
             rteams_sorted = sorted(rteams, key=lambda t: t["projected_seed"])
-            survivors = rteams_sorted[:]
+            survivors     = rteams_sorted[:]
 
             for round_name in ["r64", "r32", "s16", "e8"]:
                 next_round = []
@@ -154,14 +165,14 @@ def simulate_bracket(field: list[dict], simulations: int = 1000) -> list[dict]:
         if len(champ_game) >= 2:
             champion = simulate_game(champ_game[0], champ_game[1])
             win_counts[champion["id"]]["championship"] += 1
-            win_counts[champion["id"]]["champion"] += 1
+            win_counts[champion["id"]]["champion"]     += 1
         elif champ_game:
             win_counts[champ_game[0]["id"]]["championship"] += 1
-            win_counts[champ_game[0]["id"]]["champion"] += 1
+            win_counts[champ_game[0]["id"]]["champion"]     += 1
 
-    # Attach probabilities
+    # Attach probabilities to each team
     for team in field:
-        tid = team["id"]
+        tid    = team["id"]
         counts = win_counts.get(tid, {r: 0 for r in rounds})
         for r in rounds:
             team[f"prob_{r}"] = round(counts[r] / simulations, 4)
@@ -169,136 +180,213 @@ def simulate_bracket(field: list[dict], simulations: int = 1000) -> list[dict]:
     return field
 
 
-# ── Data fetching ────────────────────────────────────────────────────────────
-def fetch_espn_teams(limit: int = 100) -> list[dict]:
-    """Fetch team list from ESPN public API."""
-    print(f"[ESPN] Fetching top {limit} teams …")
-    teams = []
-    page = 1
-    while len(teams) < limit:
-        try:
-            r = requests.get(
-                ESPN_TEAMS,
-                params={"limit": min(50, limit - len(teams)), "page": page},
-                headers=HEADERS,
-                timeout=10
-            )
-            r.raise_for_status()
-            data = r.json()
-            batch = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
-            if not batch:
+# ── NCAA API helpers ──────────────────────────────────────────────────────────
+def ncaa_get(path: str, params: dict = None) -> dict | list | None:
+    """GET from the henrygd NCAA API with error handling."""
+    url = f"{NCAA_API_BASE}{path}"
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"  [warn] NCAA API {path}: {e}")
+        return None
+
+
+def bbart_get(path: str, params: dict = None) -> dict | list | None:
+    """GET from barttorvik.com with error handling."""
+    url = f"{BBART_BASE}{path}"
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"  [warn] Barttorvik {path}: {e}")
+        return None
+
+
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def fetch_standings(limit: int = 100) -> list[dict]:
+    """
+    Fetch D1 men's basketball standings from the NCAA API.
+    Returns a flat list of team dicts with wins/losses/conference.
+    """
+    print("[NCAA API] Fetching D1 standings …")
+    data = ncaa_get("/standings/basketball-men/d1")
+    if not data:
+        return []
+
+    teams   = []
+    team_id = 1  # synthetic ID since standings don't carry ESPN-style IDs
+
+    for conf_block in data.get("data", []):
+        conf_name = conf_block.get("conference", "Unknown")
+        for entry in conf_block.get("standings", []):
+            school = entry.get("School", "Unknown")
+            wins   = int(entry.get("Overall W", 0))
+            losses = int(entry.get("Overall L", 0))
+            teams.append({
+                "id":         str(team_id),
+                "name":       school,
+                "abbrev":     school[:6].upper().replace(" ", ""),
+                "conference": conf_name,
+                "wins":       wins,
+                "losses":     losses,
+                # placeholders — enriched later
+                "ppg":        0,
+                "opp_ppg":    0,
+                "ap_rank":    999,
+                "coaches_rank": 999,
+                "net_rank":   200,
+                "trank":      200,
+                "barthag":    0.5,
+                "sos":        0.5,
+                "rpi_rank":   200,
+            })
+            team_id += 1
+
+            if len(teams) >= limit:
                 break
-            for entry in batch:
-                t = entry.get("team", {})
-                teams.append({
-                    "id":         t.get("id", ""),
-                    "name":       t.get("displayName", "Unknown"),
-                    "abbrev":     t.get("abbreviation", ""),
-                    "location":   t.get("location", ""),
-                    "conference": t.get("conferenceId", "Unknown"),
-                    "color":      t.get("color", ""),
-                })
-            page += 1
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"  [warn] ESPN teams page {page}: {e}")
+        if len(teams) >= limit:
             break
 
-    print(f"  → Fetched {len(teams)} teams")
+    print(f"  → {len(teams)} teams from standings")
     return teams
 
 
-def fetch_espn_rankings() -> dict[str, dict]:
-    """Fetch AP / Coaches poll + NET rankings."""
-    print("[ESPN] Fetching rankings …")
-    ranked: dict[str, dict] = {}
-    try:
-        r = requests.get(ESPN_RANKINGS, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        polls = r.json().get("rankings", [])
-        for poll in polls:
-            name = poll.get("name", "")
-            for entry in poll.get("ranks", []):
-                tid   = str(entry.get("team", {}).get("id", ""))
-                rank  = entry.get("current", 999)
-                if tid not in ranked:
-                    ranked[tid] = {}
-                if "AP" in name:
-                    ranked[tid]["ap_rank"] = rank
-                elif "NET" in name.upper():
-                    ranked[tid]["net_rank"] = rank
-                elif "Coach" in name:
-                    ranked[tid]["coaches_rank"] = rank
-    except Exception as e:
-        print(f"  [warn] rankings: {e}")
-    print(f"  → Got ranking data for {len(ranked)} teams")
-    return ranked
+def fetch_ncaa_rankings() -> dict[str, int]:
+    """
+    Fetch AP and NET rankings from the NCAA API.
+    Returns { team_name_lower: net_rank } mapping.
+    """
+    print("[NCAA API] Fetching rankings (AP + NET) …")
+    net_map: dict[str, int] = {}
+    ap_map:  dict[str, int] = {}
+
+    # AP poll
+    ap_data = ncaa_get("/rankings/basketball-men/d1/associated-press")
+    if ap_data:
+        for entry in ap_data.get("data", []):
+            school = entry.get("SCHOOL", "").split("(")[0].strip().lower()
+            rank   = int(entry.get("RANK", 999))
+            ap_map[school] = rank
+
+    # NET rankings (ncaa.com publishes these)
+    net_data = ncaa_get("/rankings/basketball-men/d1/ncaa-mens-basketball-net-rankings")
+    if net_data:
+        for entry in net_data.get("data", []):
+            school = entry.get("SCHOOL", entry.get("Team", "")).lower()
+            rank   = int(entry.get("RANK", entry.get("NET", 200)))
+            net_map[school] = rank
+
+    print(f"  → AP rankings: {len(ap_map)} teams | NET rankings: {len(net_map)} teams")
+    return {"ap": ap_map, "net": net_map}
 
 
-def fetch_team_record(team_id: str) -> dict:
-    """Fetch W-L record and basic stats for one team."""
-    try:
-        r = requests.get(
-            ESPN_TEAM_STATS.format(team_id=team_id),
-            headers=HEADERS,
-            timeout=10
-        )
-        r.raise_for_status()
-        splits = r.json().get("splitCategories", [])
-        record = {}
-        for cat in splits:
-            if cat.get("name") == "overall":
-                for item in cat.get("splits", []):
-                    if item.get("displayName") == "Overall":
-                        stats = item.get("stats", [])
-                        for s in stats:
-                            n = s.get("name", "")
-                            v = s.get("value", 0)
-                            if n == "wins":       record["wins"]   = int(v)
-                            elif n == "losses":   record["losses"] = int(v)
-                            elif n == "avgPoints":record["ppg"]    = round(float(v), 1)
-                            elif n == "avgPointsAgainst": record["opp_ppg"] = round(float(v), 1)
-        return record
-    except Exception:
+def fetch_barttorvik_stats(year: int = SEASON) -> dict[str, dict]:
+    """
+    Pull T-Rank / advanced stats from barttorvik.com (free, no key).
+    Returns { team_name_lower: { trank, barthag, adj_oe, adj_de, sos, ... } }
+    """
+    print(f"[Barttorvik] Fetching T-Rank / advanced stats for {year} …")
+    # Barttorvik exposes a JSON endpoint used by their own site
+    data = bbart_get("/trank.php", params={"year": year, "json": 1})
+
+    result: dict[str, dict] = {}
+    if not data:
+        print("  [warn] Barttorvik returned no data — metrics will use fallback values")
+        return result
+
+    # Response is a list of team rows
+    rows = data if isinstance(data, list) else data.get("teams", [])
+    for i, row in enumerate(rows):
+        # Field names vary slightly; handle both styles
+        name    = (row.get("team") or row.get("Team") or "").lower().strip()
+        if not name:
+            continue
+        result[name] = {
+            "trank":   i + 1,                                              # position in list = T-Rank
+            "barthag": float(row.get("barthag",   row.get("Barthag",   0.5))),
+            "adj_oe":  float(row.get("adjoe",     row.get("AdjOE",    100))),
+            "adj_de":  float(row.get("adjde",     row.get("AdjDE",    100))),
+            "sos":     float(row.get("sos",        row.get("SOS",      0.5))),
+            "ppg":     float(row.get("obs_ef",     row.get("ORtg",      0))),  # off rating proxy
+            "opp_ppg": float(row.get("dbs_ef",     row.get("DRtg",      0))),
+        }
+
+    print(f"  → Got Barttorvik data for {len(result)} teams")
+    return result
+
+
+def enrich_teams(
+    teams:     list[dict],
+    rankings:  dict[str, dict],
+    bbart:     dict[str, dict],
+) -> list[dict]:
+    """
+    Merge NCAA API rankings + Barttorvik advanced stats into each team.
+    Uses fuzzy name matching (lowercase, strip suffixes).
+    """
+    print("[ENRICH] Merging rankings + advanced stats …")
+
+    ap_map  = rankings.get("ap",  {})
+    net_map = rankings.get("net", {})
+
+    def find_bbart(name: str) -> dict:
+        """Try to match team name to a Barttorvik key."""
+        key = name.lower().strip()
+        if key in bbart:
+            return bbart[key]
+        # Try without common suffixes
+        for suffix in [" university", " college", " state", " st."]:
+            short = key.replace(suffix, "").strip()
+            if short in bbart:
+                return bbart[short]
+        # Partial match
+        for k, v in bbart.items():
+            if k in key or key in k:
+                return v
         return {}
 
+    for team in teams:
+        name = team["name"]
+        key  = name.lower().strip()
 
-def enrich_with_records(teams: list[dict], rankings: dict[str, dict]) -> list[dict]:
-    """Merge rankings + fetch per-team records (rate-limited)."""
-    print(f"[ESPN] Fetching per-team records (this may take ~{len(teams) * 0.5:.0f}s) …")
-    for i, team in enumerate(teams):
-        tid = str(team["id"])
+        # Rankings
+        team["ap_rank"]      = ap_map.get(key,  999)
+        team["coaches_rank"] = 999   # not separately published by NCAA API
+        team["net_rank"]     = net_map.get(key, 200)
+        team["rpi_rank"]     = team["net_rank"]   # NET is the modern RPI replacement
 
-        # Merge rankings
-        rk = rankings.get(tid, {})
-        team["ap_rank"]      = rk.get("ap_rank",      999)
-        team["coaches_rank"] = rk.get("coaches_rank", 999)
-        team["net_rank"]     = rk.get("net_rank",     200)
+        # Barttorvik advanced stats
+        bb = find_bbart(name)
+        if bb:
+            team["trank"]   = bb.get("trank",   200)
+            team["barthag"] = bb.get("barthag",  0.5)
+            team["adj_oe"]  = bb.get("adj_oe",  100)
+            team["adj_de"]  = bb.get("adj_de",  100)
+            team["sos"]     = bb.get("sos",      0.5)
+            if bb.get("ppg"):
+                team["ppg"]     = round(bb["ppg"],     1)
+                team["opp_ppg"] = round(bb["opp_ppg"], 1)
+        else:
+            # Fallback so seed_score still works
+            team["trank"]   = 200
+            team["barthag"] = 0.5
+            team["adj_oe"]  = 100
+            team["adj_de"]  = 100
 
-        # Fetch record
-        rec = fetch_team_record(tid)
-        team["wins"]    = rec.get("wins",    random.randint(10, 28))  # fallback estimate
-        team["losses"]  = rec.get("losses",  random.randint(2,  10))
-        team["ppg"]     = rec.get("ppg",     0)
-        team["opp_ppg"] = rec.get("opp_ppg", 0)
-
-        # Synthetic RPI / SOS (ESPN doesn't expose these freely)
-        team["rpi_rank"] = team["net_rank"]          # proxy
-        team["sos"]      = round(random.uniform(0.3, 0.9), 3)   # placeholder
-
-        if i % 10 == 0:
-            print(f"  … {i}/{len(teams)} teams processed")
-        time.sleep(0.25)
-
+    print("  → Enrichment complete")
     return teams
 
 
-# ── CSV export ───────────────────────────────────────────────────────────────
+# ── CSV export ────────────────────────────────────────────────────────────────
 def export_team_stats(teams: list[dict], path: Path) -> None:
     fields = [
         "name", "abbrev", "conference",
         "wins", "losses", "ppg", "opp_ppg",
-        "ap_rank", "coaches_rank", "net_rank", "rpi_rank", "sos",
+        "ap_rank", "net_rank", "trank", "barthag",
+        "adj_oe", "adj_de", "sos",
         "seed_score", "projected_seed", "projected_region",
     ]
     with open(path, "w", newline="") as f:
@@ -311,7 +399,7 @@ def export_team_stats(teams: list[dict], path: Path) -> None:
 def export_bracket(teams: list[dict], path: Path) -> None:
     fields = [
         "name", "abbrev", "projected_seed", "projected_region",
-        "seed_score",
+        "seed_score", "barthag",
         "prob_r64", "prob_r32", "prob_s16", "prob_e8",
         "prob_f4", "prob_championship", "prob_champion",
     ]
@@ -327,37 +415,35 @@ def export_bracket(teams: list[dict], path: Path) -> None:
     print(f"[CSV] Bracket predictions → {path}")
 
 
-def export_player_stats(teams: list[dict], path: Path) -> None:
-    """
-    ESPN's public API doesn't reliably expose player rosters without auth.
-    We create a placeholder CSV with team-level per-game stats and note
-    that a sports-reference.com or SportsDataIO key would populate this.
-    """
-    rows = []
-    for team in teams:
-        if not isinstance(team.get("projected_seed"), int):
-            continue
-        rows.append({
-            "team":            team["name"],
-            "team_abbrev":     team["abbrev"],
-            "projected_seed":  team["projected_seed"],
-            "team_ppg":        team.get("ppg", "N/A"),
-            "team_opp_ppg":    team.get("opp_ppg", "N/A"),
-            "note": "Per-player stats require sports-reference.com scraping or a paid API key (see README)"
-        })
+def export_advanced_stats(teams: list[dict], path: Path) -> None:
+    """Export Barttorvik-sourced advanced metrics for tournament teams."""
+    fields = [
+        "name", "abbrev", "conference",
+        "projected_seed", "projected_region",
+        "wins", "losses",
+        "net_rank", "trank", "barthag",
+        "adj_oe", "adj_de", "sos",
+        "ppg", "opp_ppg",
+    ]
+    tourney = [t for t in teams if isinstance(t.get("projected_seed"), int)]
+    tourney_sorted = sorted(
+        tourney,
+        key=lambda t: (t.get("projected_region", ""), t.get("projected_seed", 99))
+    )
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
-        w.writerows(rows)
-    print(f"[CSV] Player stats placeholder → {path}")
+        w.writerows(tourney_sorted)
+    print(f"[CSV] Advanced stats → {path}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="March Madness Tracker")
     parser.add_argument("--teams",       type=int, default=75,   help="Number of teams to fetch (default: 75)")
     parser.add_argument("--simulations", type=int, default=1000, help="Bracket simulations (default: 1000)")
     parser.add_argument("--output",      type=str, default="output", help="Output directory")
+    parser.add_argument("--year",        type=int, default=SEASON,   help=f"Season year (default: {SEASON})")
     args = parser.parse_args()
 
     out = Path(args.output)
@@ -367,38 +453,41 @@ def main():
 
     print("=" * 55)
     print("  🏀  March Madness Tracker  🏀")
+    print(f"  Sources: NCAA API + Barttorvik | Season {args.year}")
     print("=" * 55)
 
-    # 1. Fetch
-    teams    = fetch_espn_teams(limit=args.teams)
-    rankings = fetch_espn_rankings()
-    teams    = enrich_with_records(teams, rankings)
+    # 1. Fetch base data
+    teams     = fetch_standings(limit=args.teams)
+    rankings  = fetch_ncaa_rankings()
+    bbart     = fetch_barttorvik_stats(year=args.year)
 
-    # 2. Score & seed
+    # 2. Merge everything
+    teams = enrich_teams(teams, rankings, bbart)
+
+    # 3. Score & seed
     for team in teams:
         team["seed_score"] = compute_seed_score(team)
     teams = assign_seeds(teams)
 
-    # 3. Simulate bracket
+    # 4. Simulate bracket
     print(f"\n[SIM] Running {args.simulations:,} bracket simulations …")
     teams = simulate_bracket(teams, simulations=args.simulations)
     print("  → Done")
 
-    # 4. Export
+    # 5. Export timestamped + latest copies
     print("\n[EXPORT] Writing CSVs …")
-    export_team_stats(teams,   out / f"team_stats_{ts}.csv")
-    export_bracket(teams,      out / f"bracket_predictions_{ts}.csv")
-    export_player_stats(teams, out / f"player_stats_{ts}.csv")
+    export_team_stats(teams,     out / f"team_stats_{ts}.csv")
+    export_bracket(teams,        out / f"bracket_predictions_{ts}.csv")
+    export_advanced_stats(teams, out / f"advanced_stats_{ts}.csv")
 
-    # Latest symlink-style copies (overwrite)
-    export_team_stats(teams,   out / "team_stats_latest.csv")
-    export_bracket(teams,      out / "bracket_predictions_latest.csv")
-    export_player_stats(teams, out / "player_stats_latest.csv")
+    export_team_stats(teams,     out / "team_stats_latest.csv")
+    export_bracket(teams,        out / "bracket_predictions_latest.csv")
+    export_advanced_stats(teams, out / "advanced_stats_latest.csv")
 
     print("\n✅  All done! CSVs saved to:", out.resolve())
     print("   team_stats_latest.csv          – full team metrics + seedings")
     print("   bracket_predictions_latest.csv – round-by-round win probabilities")
-    print("   player_stats_latest.csv        – team-level per-game stats")
+    print("   advanced_stats_latest.csv      – NET rank, T-Rank, Barthag, adj. ratings")
 
 
 if __name__ == "__main__":
