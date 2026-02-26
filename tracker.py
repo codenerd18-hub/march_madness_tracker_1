@@ -123,9 +123,12 @@ def fetch_raw_rankings(out: Path) -> tuple[dict, dict]:
             points = entry.get("POINTS", "")
             prev   = entry.get("PREVIOUS", "")
             record = entry.get("RECORD", "")
-            ap_rows.append({"rank": rank, "school": school, "points": points,
-                            "previous_rank": prev, "record": record})
-            ap_map[school.lower()] = rank
+            if school:
+                ap_rows.append({"rank": rank, "school": school, "points": points,
+                                "previous_rank": prev, "record": record})
+                # Store under multiple name variants for better matching
+                for variant in _name_variants(school):
+                    ap_map[variant] = rank
     _write_csv(ap_rows, out / "raw_rankings_ap.csv")
 
     # NET
@@ -134,12 +137,69 @@ def fetch_raw_rankings(out: Path) -> tuple[dict, dict]:
         for entry in net_data.get("data", []):
             school = entry.get("SCHOOL", entry.get("Team", "")).strip()
             rank   = _safe_int(entry.get("RANK", entry.get("NET")), 999)
-            net_rows.append({"net_rank": rank, "school": school})
-            net_map[school.lower()] = rank
+            if school:
+                net_rows.append({"net_rank": rank, "school": school})
+                for variant in _name_variants(school):
+                    net_map[variant] = rank
     _write_csv(net_rows, out / "raw_rankings_net.csv")
 
-    print(f"  → AP: {len(ap_map)} teams | NET: {len(net_map)} teams")
+    print(f"  → AP: {len(ap_rows)} teams | NET: {len(net_rows)} teams")
     return ap_map, net_map
+
+
+def _name_variants(name: str) -> list[str]:
+    """
+    Generate multiple lowercase variants of a school name
+    so fuzzy matching works across NCAA API / Barttorvik / standings
+    name differences (e.g. 'UConn' vs 'Connecticut', 'Saint Mary's (CA)' vs "Saint Mary's").
+    """
+    base = name.lower().strip()
+    # Strip parenthetical suffixes like "(CA)", "(OH)"
+    no_paren = base.split("(")[0].strip()
+    # Common abbreviation expansions
+    ALIASES = {
+        "uconn":            "connecticut",
+        "connecticut":      "uconn",
+        "lsu":              "louisiana state",
+        "louisiana state":  "lsu",
+        "ucl a":            "ucla",
+        "usc":              "southern california",
+        "southern cal":     "southern california",
+        "ole miss":         "mississippi",
+        "mississippi":      "ole miss",
+        "pitt":             "pittsburgh",
+        "pittsburgh":       "pitt",
+        "miami (fl)":       "miami",
+        "miami fl":         "miami",
+        "nc state":         "north carolina state",
+        "north carolina st":"nc state",
+        "saint mary's":     "st. mary's",
+        "st. mary's":       "saint mary's",
+        "smu":              "southern methodist",
+        "vcu":              "virginia commonwealth",
+        "unlv":             "nevada las vegas",
+        "utep":             "texas el paso",
+        "utsa":             "texas san antonio",
+        "tcu":              "texas christian",
+        "byu":              "brigham young",
+        "wku":              "western kentucky",
+        "fiu":              "florida international",
+        "fau":              "florida atlantic",
+        "uab":              "alabama birmingham",
+        "umass":            "massachusetts",
+        "unc":              "north carolina",
+        "north carolina":   "unc",
+    }
+    variants = {base, no_paren}
+    # Add alias if known
+    if no_paren in ALIASES:
+        variants.add(ALIASES[no_paren])
+    if base in ALIASES:
+        variants.add(ALIASES[base])
+    # Strip common suffixes
+    for suffix in [" university", " college", " state", " st."]:
+        variants.add(no_paren.replace(suffix, "").strip())
+    return list(variants)
 
 
 def fetch_raw_barttorvik(year: int, out: Path) -> dict:
@@ -196,6 +256,7 @@ def fetch_raw_barttorvik(year: int, out: Path) -> dict:
             "stl_pct":      _safe_float(row.get("stl"),                         0.0),
             "avg_hgt":      _safe_float(row.get("avg_hgt"),                     0.0),
             "experience":   _safe_float(row.get("exp",     row.get("Exp")),     0.0),
+            "ap_rank":      _safe_int(row.get("ap",      row.get("APRank")),   999),
         }
 
     _write_csv(raw_rows, out / "raw_barttorvik.csv")
@@ -213,13 +274,22 @@ def enrich_teams(standings: list[dict], ap_map: dict, net_map: dict,
 
     for row in standings:
         name = row["name"]
-        key  = name.lower().strip()
 
         bb = _find_bbart(name, bbart)
 
         wins   = _safe_int(row["overall_wins"],   bb.get("wins",   0))
         losses = _safe_int(row["overall_losses"],  bb.get("losses", 0))
         total  = wins + losses
+
+        # Use all name variants for ranking lookups to handle UConn/Connecticut etc.
+        ap_rank  = 999
+        net_rank = 200
+        for variant in _name_variants(name):
+            if ap_rank  == 999 and variant in ap_map:  ap_rank  = ap_map[variant]
+            if net_rank == 200 and variant in net_map: net_rank = net_map[variant]
+        # Fallback: Barttorvik tracks ap_rank directly
+        if ap_rank == 999 and bb.get("ap_rank", 999) != 999:
+            ap_rank = bb["ap_rank"]
 
         team = {
             # Identity
@@ -236,8 +306,8 @@ def enrich_teams(standings: list[dict], ap_map: dict, net_map: dict,
             "conf_losses":  _safe_int(row["conf_losses"], 0),
             "streak":       row.get("streak", ""),
             # Rankings
-            "ap_rank":      ap_map.get(key, 999),
-            "net_rank":     net_map.get(key, bb.get("seed", 200) if bb else 200),
+            "ap_rank":      ap_rank,
+            "net_rank":     net_rank,
             # Barttorvik advanced
             "trank":        bb.get("trank",        200),
             "barthag":      bb.get("barthag",       0.5),
