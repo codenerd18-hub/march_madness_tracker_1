@@ -29,11 +29,21 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Save output to temp location outside repo
+          cp -r output /tmp/tracker_output
+
+          # Create a clean orphan branch (no history, no source files = no conflicts)
+          git checkout --orphan data-tmp
+          git rm -rf . --quiet
+
+          # Restore only the output CSVs
+          cp -r /tmp/tracker_output output
+
           git add output/
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "chore: update March Madness data $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git fetch origin data
-          git rebase origin/data
-          git push origin HEAD:data
+
+          # Force push — data branch is storage only, not code
+          git push origin HEAD:data --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
