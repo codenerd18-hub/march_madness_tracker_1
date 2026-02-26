@@ -23,7 +23,7 @@ jobs:
         run: pip install requests
 
       - name: Run tracker
-        run: python tracker.py --teams 80 --simulations 2000
+        run: python tracker.py --simulations 2000
 
       - name: Commit updated CSVs
         run: |
